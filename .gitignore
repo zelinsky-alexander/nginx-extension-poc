@@ -1,0 +1,5 @@
+lab/certs/
+*.so
+*.o
+build/
+.nginx-build/
