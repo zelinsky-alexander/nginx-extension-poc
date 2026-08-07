@@ -1,0 +1,39 @@
+name: build-poc
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        nginx_version: ["1.28.0"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential curl libpcre2-dev zlib1g-dev libssl-dev
+
+      - name: Download NGINX source
+        run: |
+          curl -fLO "https://nginx.org/download/nginx-${{ matrix.nginx_version }}.tar.gz"
+          tar xzf "nginx-${{ matrix.nginx_version }}.tar.gz"
+
+      - name: Configure
+        working-directory: nginx-${{ matrix.nginx_version }}
+        run: |
+          ./configure \
+            --with-http_ssl_module \
+            --with-compat \
+            --add-dynamic-module="$GITHUB_WORKSPACE"
+
+      - name: Build dynamic module
+        working-directory: nginx-${{ matrix.nginx_version }}
+        run: |
+          make -j"$(nproc)" modules
+          test -s objs/ngx_http_upstream_identity_module.so
