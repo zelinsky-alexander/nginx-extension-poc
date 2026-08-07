@@ -68,11 +68,19 @@ Configure:
   --add-dynamic-module="$POC_DIR"
 ```
 
-Build and install:
+Build NGINX and the dynamic module:
 
 ```bash
 make -j"$(nproc)"
+make modules
 make install
+```
+
+Copy the module explicitly into the isolated NGINX prefix:
+
+```bash
+mkdir -p "$NGINX_PREFIX/modules"
+cp objs/ngx_http_upstream_identity_module.so "$NGINX_PREFIX/modules/"
 ```
 
 Confirm the module exists:
