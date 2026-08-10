@@ -1,14 +1,27 @@
 # PoC tests
 
-Run these tests only after completing [LAB_SETUP.md](LAB_SETUP.md).
+Run these tests after completing [LAB_SETUP.md](LAB_SETUP.md).
 
-The purpose is to answer a small set of feasibility questions before any longitudinal database or agent is built.
+The current experiment uses the upstream peer lifecycle rather than the downstream response header filter. The expected successful observation stage is:
+
+```text
+stage="peer_free"
+```
 
 ## Test 1 — Observe one HTTPS upstream
 
-Backend A should be running on `127.0.0.1:9443` with `backend-a.cert.pem`.
+Start backend A on `127.0.0.1:9443`:
 
-Send:
+```bash
+cd "$POC_DIR"
+openssl s_server \
+  -accept 127.0.0.1:9443 \
+  -cert lab/certs/backend-a.cert.pem \
+  -key lab/certs/backend-a.key.pem \
+  -www
+```
+
+In another terminal send:
 
 ```bash
 curl -sS http://127.0.0.1:8080/ >/dev/null
@@ -20,9 +33,10 @@ Inspect:
 grep 'upstream_identity' "$HOME/nginx-upstream-identity-poc/logs/error.log" | tail -n 5
 ```
 
-Pass if the latest entry contains:
+Pass if the latest successful observation contains:
 
 ```text
+stage="peer_free"
 peer="127.0.0.1:9443"
 tls="..."
 cert_sha256="<64 hex chars>"
@@ -32,9 +46,7 @@ san_dns="backend.test"
 
 An empty `alpn` is acceptable in this lab.
 
-### Independent certificate check
-
-Verify that NGINX's certificate fingerprint matches OpenSSL's fingerprint after removing separators and normalizing case:
+Verify the leaf certificate independently:
 
 ```bash
 openssl x509 \
@@ -44,17 +56,13 @@ openssl x509 \
   -sha256
 ```
 
-The value should correspond to `cert_sha256` in the module log.
+After removing separators and normalizing case, this must match `cert_sha256` from the module log.
 
-## Test 2 — Same address, different cryptographic identity
+## Test 2 — Same address, different TLS identity
 
-This is the key proof-of-concept test.
-
-1. Stop backend A with `Ctrl+C`.
-2. Start backend B at exactly the same address and port:
+Stop backend A and start backend B at the same address:
 
 ```bash
-cd "$POC_DIR"
 openssl s_server \
   -accept 127.0.0.1:9443 \
   -cert lab/certs/backend-b.cert.pem \
@@ -62,30 +70,22 @@ openssl s_server \
   -www
 ```
 
-3. Send another request:
+Send another request:
 
 ```bash
 curl -sS http://127.0.0.1:8080/ >/dev/null
 ```
 
-4. Compare the last observations:
+Compare observations:
 
 ```bash
-grep 'upstream_identity' "$HOME/nginx-upstream-identity-poc/logs/error.log" | tail -n 2
+grep 'upstream_identity.*stage="peer_free"' \
+  "$HOME/nginx-upstream-identity-poc/logs/error.log" | tail -n 2
 ```
 
-Pass if:
+Pass if the peer remains `127.0.0.1:9443`, while both certificate and SPKI fingerprints change and HTTP still succeeds.
 
-```text
-peer is unchanged
-cert_sha256 changed
-spki_sha256 changed
-HTTP request still succeeds
-```
-
-This demonstrates that ordinary availability can remain healthy while the upstream's cryptographic identity changes.
-
-## Test 3 — Repeated requests are stable
+## Test 3 — Repeated stable requests
 
 With one backend identity running:
 
@@ -95,53 +95,26 @@ for i in $(seq 1 20); do
 done
 ```
 
-Inspect the observations:
+Inspect:
 
 ```bash
-grep 'upstream_identity' "$HOME/nginx-upstream-identity-poc/logs/error.log" | tail -n 20
+grep 'upstream_identity.*stage="peer_free"' \
+  "$HOME/nginx-upstream-identity-poc/logs/error.log" | tail -n 20
 ```
 
-Pass if all entries for the same backend show the same certificate and SPKI fingerprints.
+Pass if every observation for the same backend has the same certificate and SPKI fingerprints.
 
-This PoC currently logs once per proxied response. The production design should avoid expensive per-request certificate work and move toward connection-level observation or aggressive deduplication.
+## Test 4 — Backend unavailable
 
-## Test 4 — Module disabled
-
-Edit the lab configuration:
-
-```nginx
-upstream_identity_monitor off;
-```
-
-Reload:
-
-```bash
-"$HOME/nginx-upstream-identity-poc/sbin/nginx" \
-  -p "$HOME/nginx-upstream-identity-poc/" \
-  -s reload
-```
-
-Record the current log line count:
-
-```bash
-grep -c 'upstream_identity' "$HOME/nginx-upstream-identity-poc/logs/error.log"
-```
-
-Send several requests and repeat the count. Pass if no new identity observations are added while requests still succeed.
-
-Restore `upstream_identity_monitor on;` before continuing.
-
-## Test 5 — Backend unavailable
-
-Stop `openssl s_server` and send:
+Stop the backend and send:
 
 ```bash
 curl -i http://127.0.0.1:8080/
 ```
 
-Expected: NGINX returns an upstream error such as `502 Bad Gateway`.
+Expected: NGINX returns an upstream error such as `502 Bad Gateway`. The module may report an unavailable peer lifecycle observation, but NGINX must not crash.
 
-The module must not crash NGINX. Confirm:
+Confirm:
 
 ```bash
 "$HOME/nginx-upstream-identity-poc/sbin/nginx" \
@@ -151,51 +124,24 @@ The module must not crash NGINX. Confirm:
 pgrep -a nginx
 ```
 
-Pass if the worker/master processes remain healthy.
+## Test 5 — Two peers
 
-## Test 6 — Two peers
-
-After the single-peer tests pass, extend `lab/nginx.conf` temporarily:
+Configure:
 
 ```nginx
 upstream backend_tls {
     server 127.0.0.1:9443;
     server 127.0.0.1:9444;
+    upstream_identity_peer_monitor;
 }
 ```
 
-Run backend A:
-
-```bash
-openssl s_server \
-  -accept 127.0.0.1:9443 \
-  -cert lab/certs/backend-a.cert.pem \
-  -key lab/certs/backend-a.key.pem \
-  -www
-```
-
-Run backend B in another terminal:
-
-```bash
-openssl s_server \
-  -accept 127.0.0.1:9444 \
-  -cert lab/certs/backend-b.cert.pem \
-  -key lab/certs/backend-b.key.pem \
-  -www
-```
-
-Reload NGINX and send repeated requests:
+Run backend A on `9443` and backend B on `9444`, reload NGINX, then:
 
 ```bash
 for i in $(seq 1 20); do
   curl -sS http://127.0.0.1:8080/ >/dev/null
 done
-```
-
-Inspect:
-
-```bash
-grep 'upstream_identity' "$HOME/nginx-upstream-identity-poc/logs/error.log" | tail -n 20
 ```
 
 Pass if observations correctly associate:
@@ -205,62 +151,81 @@ Pass if observations correctly associate:
 127.0.0.1:9444 -> identity B
 ```
 
-The exact selection pattern is not important. Correct peer-to-identity association is.
+## Test 6 — Keepalive reuse
 
-## Test 7 — Worker concurrency smoke test
-
-Change:
+Configure the upstream with the identity directive after `keepalive`:
 
 ```nginx
-worker_processes 4;
+upstream backend_tls {
+    server 127.0.0.1:9443;
+    keepalive 16;
+    upstream_identity_peer_monitor;
+}
 ```
 
-Reload NGINX and run:
-
-```bash
-seq 1 200 | xargs -n1 -P16 -I{} \
-  curl -sS http://127.0.0.1:8080/ -o /dev/null
-```
-
-Pass if:
-
-- all requests complete apart from expected transient test-lab failures;
-- NGINX does not crash;
-- log lines remain syntactically intact;
-- fingerprints remain associated with the correct peer.
-
-This is not a performance benchmark. It is only a concurrency smoke test.
-
-## Test 8 — Keepalive experiment
-
-This is exploratory because the PoC observes at the response header-filter stage rather than at TLS-connection creation.
-
-Add inside `upstream backend_tls`:
-
-```nginx
-keepalive 16;
-```
-
-Add inside the proxy location:
+And in the proxy location:
 
 ```nginx
 proxy_http_version 1.1;
 proxy_set_header Connection "";
 ```
 
-Repeat multiple requests and inspect the logs.
+Reload and send repeated requests:
 
-Questions to record:
+```bash
+for i in $(seq 1 20); do
+  curl -sS http://127.0.0.1:8080/ >/dev/null || exit 1
+done
+```
 
-1. Is `r->upstream->peer.connection` always available at the header-filter phase?
-2. Does TLS metadata remain accessible on reused upstream connections?
-3. Do retries/failover produce observations for only the successful peer or also failed attempts?
+Inspect:
 
-These answers determine whether the real implementation can stay on a normal module phase or needs a different upstream lifecycle integration point.
+```bash
+grep 'upstream_identity' "$HOME/nginx-upstream-identity-poc/logs/error.log" | tail -n 40
+```
+
+Expected experimental behavior:
+
+- `stage="peer_free"` sees a live TLS connection before it is cached;
+- a reused keepalive connection may also produce `stage="peer_get_reused"`;
+- fingerprints remain associated with the correct peer.
+
+If `peer_free` becomes unavailable only when keepalive is enabled, verify that `upstream_identity_peer_monitor;` is placed after `keepalive 16;` in the upstream block.
+
+## Test 7 — Worker concurrency smoke test
+
+Set:
+
+```nginx
+worker_processes 4;
+```
+
+Reload and run:
+
+```bash
+seq 1 200 | xargs -n1 -P16 -I{} \
+  curl -sS http://127.0.0.1:8080/ -o /dev/null
+```
+
+Pass if NGINX remains healthy, log records remain intact, and identities stay associated with the correct peer.
+
+## Legacy header-filter comparison
+
+The old location directive remains available:
+
+```nginx
+upstream_identity_monitor on;
+```
+
+On the tested NGINX 1.28.0 WSL path it produced:
+
+```text
+stage="header_filter" reason=peer_connection_missing
+```
+
+That result motivated the peer-lifecycle experiment. It is not the expected observation mechanism for the current lab.
 
 ## Test results template
-
-Record results in an issue or temporary notes using:
 
 ```text
 NGINX version:
@@ -268,25 +233,17 @@ OpenSSL version:
 Ubuntu version:
 WSL/native Linux:
 
-T1 single upstream: PASS/FAIL
+T1 peer_free single upstream: PASS/FAIL
 T2 certificate replacement: PASS/FAIL
 T3 repeated stability: PASS/FAIL
-T4 monitor disabled: PASS/FAIL
-T5 backend unavailable: PASS/FAIL
-T6 two peers: PASS/FAIL
+T4 backend unavailable: PASS/FAIL
+T5 two peers: PASS/FAIL
+T6 keepalive: PASS/FAIL/OBSERVATIONS
 T7 concurrency smoke: PASS/FAIL
-T8 keepalive experiment: observations
 
 Unexpected logs/errors:
 ```
 
 ## Stop condition
 
-Do not build SQLite/history/risk scoring yet if any of these occur:
-
-- upstream connection is consistently unavailable at the chosen phase;
-- certificate information disappears before the filter executes;
-- keepalive causes incorrect peer identity association;
-- retries cannot be represented correctly enough for the intended semantics.
-
-Those are integration-design problems and should be solved before adding product features.
+Do not add longitudinal storage or scoring until the peer-lifecycle hook proves correct for normal requests, keepalive reuse, and failover. If the live TLS connection is still unavailable at `peer_free`, the next experiment should move closer to upstream connection establishment rather than adding product features.
