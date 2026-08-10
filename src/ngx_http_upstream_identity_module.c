@@ -31,10 +31,6 @@ typedef struct {
 #endif
 } ngx_http_upstream_identity_peer_data_t;
 
-static ngx_http_output_header_filter_pt ngx_http_upstream_identity_next_header_filter;
-
-static ngx_int_t ngx_http_upstream_identity_header_filter(ngx_http_request_t *r);
-static ngx_int_t ngx_http_upstream_identity_init(ngx_conf_t *cf);
 static void *ngx_http_upstream_identity_create_loc_conf(ngx_conf_t *cf);
 static char *ngx_http_upstream_identity_merge_loc_conf(ngx_conf_t *cf,
     void *parent, void *child);
@@ -51,7 +47,7 @@ static void ngx_http_upstream_identity_free_peer(ngx_peer_connection_t *pc,
     void *data, ngx_uint_t state);
 static void ngx_http_upstream_identity_notify_peer(ngx_peer_connection_t *pc,
     void *data, ngx_uint_t type);
-static void ngx_http_upstream_identity_observe_connection(ngx_connection_t *c,
+static void ngx_http_upstream_identity_observe_peer(ngx_peer_connection_t *pc,
     ngx_log_t *log, const char *stage, ngx_uint_t state, ngx_uint_t cached);
 
 #if (NGX_HTTP_SSL)
@@ -96,7 +92,7 @@ static ngx_command_t ngx_http_upstream_identity_commands[] = {
 
 static ngx_http_module_t ngx_http_upstream_identity_module_ctx = {
     NULL,
-    ngx_http_upstream_identity_init,
+    NULL,
     NULL,
     NULL,
     ngx_http_upstream_identity_create_srv_conf,
@@ -274,9 +270,9 @@ ngx_http_upstream_identity_get_peer(ngx_peer_connection_t *pc, void *data)
 
     rc = peer_data->original_get(pc, peer_data->original_data);
 
-    if (rc == NGX_DONE && pc->connection != NULL) {
-        ngx_http_upstream_identity_observe_connection(pc->connection, pc->log,
-                                                      "peer_get_reused", 0, 1);
+    if (rc == NGX_DONE) {
+        ngx_http_upstream_identity_observe_peer(pc, pc->log,
+                                               "peer_get_reused", 0, 1);
     }
 
     return rc;
@@ -288,15 +284,10 @@ ngx_http_upstream_identity_free_peer(ngx_peer_connection_t *pc, void *data,
 {
     ngx_http_upstream_identity_peer_data_t *peer_data = data;
 
-    if (pc != NULL && pc->connection != NULL) {
-        ngx_http_upstream_identity_observe_connection(pc->connection, pc->log,
-                                                      "peer_free", state,
-                                                      pc->cached);
-    } else if (pc != NULL) {
-        ngx_log_error(NGX_LOG_NOTICE, pc->log, 0,
-                      "upstream_identity unavailable stage=\"peer_free\" "
-                      "reason=peer_connection_missing state=%ui",
-                      state);
+    if (pc != NULL) {
+        ngx_http_upstream_identity_observe_peer(pc, pc->log,
+                                               "peer_free", state,
+                                               pc->cached);
     }
 
     if (peer_data != NULL && peer_data->original_free != NULL) {
@@ -339,63 +330,38 @@ ngx_http_upstream_identity_save_session(ngx_peer_connection_t *pc, void *data)
 }
 #endif
 
-static ngx_int_t
-ngx_http_upstream_identity_init(ngx_conf_t *cf)
-{
-    ngx_http_upstream_identity_next_header_filter = ngx_http_top_header_filter;
-    ngx_http_top_header_filter = ngx_http_upstream_identity_header_filter;
-    return NGX_OK;
-}
-
-static ngx_int_t
-ngx_http_upstream_identity_header_filter(ngx_http_request_t *r)
-{
-    ngx_http_upstream_identity_loc_conf_t *conf;
-    ngx_connection_t *upstream_connection;
-
-    conf = ngx_http_get_module_loc_conf(r, ngx_http_upstream_identity_module);
-
-    if (conf == NULL || !conf->enabled || r->upstream == NULL) {
-        return ngx_http_upstream_identity_next_header_filter(r);
-    }
-
-    upstream_connection = r->upstream->peer.connection;
-    if (upstream_connection == NULL) {
-        ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0,
-                      "upstream_identity unavailable stage=\"header_filter\" "
-                      "reason=peer_connection_missing");
-        return ngx_http_upstream_identity_next_header_filter(r);
-    }
-
-    ngx_http_upstream_identity_observe_connection(upstream_connection,
-                                                  r->connection->log,
-                                                  "header_filter", 0,
-                                                  r->upstream->peer.cached);
-
-    return ngx_http_upstream_identity_next_header_filter(r);
-}
-
 static void
-ngx_http_upstream_identity_observe_connection(ngx_connection_t *c,
+ngx_http_upstream_identity_observe_peer(ngx_peer_connection_t *pc,
     ngx_log_t *log, const char *stage, ngx_uint_t state, ngx_uint_t cached)
 {
+    ngx_connection_t *c;
     u_char peer[NGX_SOCKADDR_STRLEN];
     size_t peer_len;
 
-    if (c == NULL || c->sockaddr == NULL) {
+    if (pc == NULL || pc->sockaddr == NULL) {
         ngx_log_error(NGX_LOG_NOTICE, log, 0,
                       "upstream_identity unavailable stage=\"%s\" "
-                      "reason=connection_address_missing state=%ui cached=%ui",
+                      "reason=peer_address_missing state=%ui cached=%ui",
                       stage, state, cached);
         return;
     }
 
-    peer_len = ngx_sock_ntop(c->sockaddr, c->socklen,
+    peer_len = ngx_sock_ntop(pc->sockaddr, pc->socklen,
                              peer, sizeof(peer), 1);
     if (peer_len >= sizeof(peer)) {
         peer_len = sizeof(peer) - 1;
     }
     peer[peer_len] = '\0';
+
+    c = pc->connection;
+    if (c == NULL) {
+        ngx_log_error(NGX_LOG_NOTICE, log, 0,
+                      "upstream_identity unavailable stage=\"%s\" "
+                      "peer=\"%s\" reason=peer_connection_missing "
+                      "state=%ui cached=%ui",
+                      stage, peer, state, cached);
+        return;
+    }
 
 #if (NGX_SSL)
     if (c->ssl != NULL && c->ssl->connection != NULL) {
@@ -445,16 +411,9 @@ ngx_http_upstream_identity_observe_connection(ngx_connection_t *c,
                       "state=%ui cached=%ui tls=\"%s\" alpn=\"%s\" "
                       "cert_sha256=\"%s\" spki_sha256=\"%s\" issuer=\"%s\" "
                       "san_dns=\"%s\"",
-                      stage,
-                      peer,
-                      state,
-                      cached,
+                      stage, peer, state, cached,
                       tls_version != NULL ? tls_version : "",
-                      alpn,
-                      cert_sha256,
-                      spki_sha256,
-                      issuer,
-                      sans);
+                      alpn, cert_sha256, spki_sha256, issuer, sans);
     } else {
         ngx_log_error(NGX_LOG_NOTICE, log, 0,
                       "upstream_identity stage=\"%s\" peer=\"%s\" "
