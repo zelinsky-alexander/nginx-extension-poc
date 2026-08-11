@@ -3,12 +3,18 @@
 #include <ngx_http.h>
 #include <ngx_http_upstream_round_robin.h>
 
+#include "ngx_http_upstream_identity_state.h"
+
 #if (NGX_SSL)
 #include <ngx_event_openssl.h>
 #include <openssl/evp.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 #endif
+
+typedef struct {
+    ngx_shm_zone_t *state_zone;
+} ngx_http_upstream_identity_main_conf_t;
 
 typedef struct {
     ngx_flag_t enabled;
@@ -18,6 +24,8 @@ typedef struct {
     ngx_flag_t configured;
     ngx_http_upstream_init_pt original_init_upstream;
     ngx_http_upstream_init_peer_pt original_init_peer;
+    ngx_shm_zone_t *state_zone;
+    ngx_str_t upstream_name;
 } ngx_http_upstream_identity_srv_conf_t;
 
 typedef struct {
@@ -25,12 +33,17 @@ typedef struct {
     ngx_event_get_peer_pt original_get;
     ngx_event_free_peer_pt original_free;
     ngx_event_notify_peer_pt original_notify;
+    ngx_shm_zone_t *state_zone;
+    ngx_str_t upstream_name;
 #if (NGX_HTTP_SSL)
     ngx_event_set_peer_session_pt original_set_session;
     ngx_event_save_peer_session_pt original_save_session;
 #endif
 } ngx_http_upstream_identity_peer_data_t;
 
+static void *ngx_http_upstream_identity_create_main_conf(ngx_conf_t *cf);
+static char *ngx_http_upstream_identity_state_zone(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
 static void *ngx_http_upstream_identity_create_loc_conf(ngx_conf_t *cf);
 static char *ngx_http_upstream_identity_merge_loc_conf(ngx_conf_t *cf,
     void *parent, void *child);
@@ -48,7 +61,9 @@ static void ngx_http_upstream_identity_free_peer(ngx_peer_connection_t *pc,
 static void ngx_http_upstream_identity_notify_peer(ngx_peer_connection_t *pc,
     void *data, ngx_uint_t type);
 static void ngx_http_upstream_identity_observe_peer(ngx_peer_connection_t *pc,
-    ngx_log_t *log, const char *stage, ngx_uint_t state, ngx_uint_t cached);
+    ngx_http_upstream_identity_peer_data_t *peer_data, ngx_log_t *log,
+    const char *stage, ngx_uint_t state, ngx_uint_t cached,
+    ngx_uint_t track_state);
 
 #if (NGX_HTTP_SSL)
 static ngx_int_t ngx_http_upstream_identity_set_session(ngx_peer_connection_t *pc,
@@ -72,6 +87,14 @@ static void ngx_http_upstream_identity_dns_sans(X509 *cert,
 
 static ngx_command_t ngx_http_upstream_identity_commands[] = {
     {
+        ngx_string("upstream_identity_state_zone"),
+        NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE2,
+        ngx_http_upstream_identity_state_zone,
+        NGX_HTTP_MAIN_CONF_OFFSET,
+        0,
+        NULL
+    },
+    {
         ngx_string("upstream_identity_monitor"),
         NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG,
         ngx_conf_set_flag_slot,
@@ -93,7 +116,7 @@ static ngx_command_t ngx_http_upstream_identity_commands[] = {
 static ngx_http_module_t ngx_http_upstream_identity_module_ctx = {
     NULL,
     NULL,
-    NULL,
+    ngx_http_upstream_identity_create_main_conf,
     NULL,
     ngx_http_upstream_identity_create_srv_conf,
     NULL,
@@ -117,6 +140,55 @@ ngx_module_t ngx_http_upstream_identity_module = {
 };
 
 static void *
+ngx_http_upstream_identity_create_main_conf(ngx_conf_t *cf)
+{
+    ngx_http_upstream_identity_main_conf_t *conf;
+
+    conf = ngx_pcalloc(cf->pool, sizeof(*conf));
+    if (conf == NULL) {
+        return NULL;
+    }
+
+    return conf;
+}
+
+static char *
+ngx_http_upstream_identity_state_zone(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+    ngx_http_upstream_identity_main_conf_t *mcf = conf;
+    ngx_str_t *value;
+    ssize_t size;
+    ngx_shm_zone_t *zone;
+
+    (void) cmd;
+
+    if (mcf->state_zone != NULL) {
+        return "is duplicate";
+    }
+
+    value = cf->args->elts;
+    size = ngx_parse_size(&value[2]);
+    if (size == NGX_ERROR || size < (ssize_t) (8 * ngx_pagesize)) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "invalid upstream identity state zone size \"%V\"",
+                           &value[2]);
+        return NGX_CONF_ERROR;
+    }
+
+    zone = ngx_shared_memory_add(cf, &value[1], (size_t) size,
+                                 &ngx_http_upstream_identity_module);
+    if (zone == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    zone->init = ngx_http_upstream_identity_state_init_zone;
+    mcf->state_zone = zone;
+
+    return NGX_CONF_OK;
+}
+
+static void *
 ngx_http_upstream_identity_create_loc_conf(ngx_conf_t *cf)
 {
     ngx_http_upstream_identity_loc_conf_t *conf;
@@ -137,6 +209,7 @@ ngx_http_upstream_identity_merge_loc_conf(ngx_conf_t *cf, void *parent,
     ngx_http_upstream_identity_loc_conf_t *prev = parent;
     ngx_http_upstream_identity_loc_conf_t *conf = child;
 
+    (void) cf;
     ngx_conf_merge_value(conf->enabled, prev->enabled, 0);
     return NGX_CONF_OK;
 }
@@ -187,6 +260,7 @@ ngx_http_upstream_identity_init_upstream(ngx_conf_t *cf,
     ngx_http_upstream_srv_conf_t *us)
 {
     ngx_http_upstream_identity_srv_conf_t *conf;
+    ngx_http_upstream_identity_main_conf_t *mcf;
 
     conf = ngx_http_conf_upstream_srv_conf(us,
                                            ngx_http_upstream_identity_module);
@@ -202,6 +276,13 @@ ngx_http_upstream_identity_init_upstream(ngx_conf_t *cf,
     if (conf->original_init_peer == NULL) {
         return NGX_ERROR;
     }
+
+    mcf = ngx_http_conf_get_module_main_conf(cf,
+                                             ngx_http_upstream_identity_module);
+    if (mcf != NULL) {
+        conf->state_zone = mcf->state_zone;
+    }
+    conf->upstream_name = us->host;
 
     us->peer.init = ngx_http_upstream_identity_init_peer;
     return NGX_OK;
@@ -233,6 +314,8 @@ ngx_http_upstream_identity_init_peer(ngx_http_request_t *r,
     peer_data->original_get = r->upstream->peer.get;
     peer_data->original_free = r->upstream->peer.free;
     peer_data->original_notify = r->upstream->peer.notify;
+    peer_data->state_zone = conf->state_zone;
+    peer_data->upstream_name = conf->upstream_name;
 #if (NGX_HTTP_SSL)
     peer_data->original_set_session = r->upstream->peer.set_session;
     peer_data->original_save_session = r->upstream->peer.save_session;
@@ -271,8 +354,8 @@ ngx_http_upstream_identity_get_peer(ngx_peer_connection_t *pc, void *data)
     rc = peer_data->original_get(pc, peer_data->original_data);
 
     if (rc == NGX_DONE) {
-        ngx_http_upstream_identity_observe_peer(pc, pc->log,
-                                               "peer_get_reused", 0, 1);
+        ngx_http_upstream_identity_observe_peer(pc, peer_data, pc->log,
+                                               "peer_get_reused", 0, 1, 0);
     }
 
     return rc;
@@ -283,11 +366,13 @@ ngx_http_upstream_identity_free_peer(ngx_peer_connection_t *pc, void *data,
     ngx_uint_t state)
 {
     ngx_http_upstream_identity_peer_data_t *peer_data = data;
+    ngx_uint_t cached = 0;
 
     if (pc != NULL) {
-        ngx_http_upstream_identity_observe_peer(pc, pc->log,
-                                               "peer_free", state,
-                                               pc->cached);
+        cached = pc->cached;
+        ngx_http_upstream_identity_observe_peer(pc, peer_data, pc->log,
+                                               "peer_free", state, cached,
+                                               state == 0 && cached == 0);
     }
 
     if (peer_data != NULL && peer_data->original_free != NULL) {
@@ -332,7 +417,9 @@ ngx_http_upstream_identity_save_session(ngx_peer_connection_t *pc, void *data)
 
 static void
 ngx_http_upstream_identity_observe_peer(ngx_peer_connection_t *pc,
-    ngx_log_t *log, const char *stage, ngx_uint_t state, ngx_uint_t cached)
+    ngx_http_upstream_identity_peer_data_t *peer_data, ngx_log_t *log,
+    const char *stage, ngx_uint_t state, ngx_uint_t cached,
+    ngx_uint_t track_state)
 {
     ngx_connection_t *c;
     u_char peer[NGX_SOCKADDR_STRLEN];
@@ -404,6 +491,14 @@ ngx_http_upstream_identity_observe_peer(ngx_peer_connection_t *pc,
 
             ngx_http_upstream_identity_dns_sans(cert, sans, sizeof(sans));
             X509_free(cert);
+        }
+
+        if (track_state && peer_data != NULL && peer_data->state_zone != NULL
+            && peer_data->upstream_name.len != 0 && cert_sha256[0] != '\0')
+        {
+            (void) ngx_http_upstream_identity_state_track(
+                peer_data->state_zone, log, &peer_data->upstream_name,
+                peer, peer_len, cert_sha256, spki_sha256);
         }
 
         ngx_log_error(NGX_LOG_NOTICE, log, 0,
