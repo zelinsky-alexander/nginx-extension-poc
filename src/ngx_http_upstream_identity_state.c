@@ -247,12 +247,13 @@ ngx_http_upstream_identity_state_compare_parts(const ngx_str_t *upstream,
     ngx_int_t rc;
     const u_char *node_peer;
 
-    rc = ngx_memn2cmp(upstream->data, node->data,
+    rc = ngx_memn2cmp(upstream->data, (u_char *) node->data,
                       upstream->len, node->upstream_len);
     if (rc != 0) {
         return rc;
     }
 
     node_peer = node->data + node->upstream_len + 1;
-    return ngx_memn2cmp(peer, node_peer, peer_len, node->peer_len);
+    return ngx_memn2cmp((u_char *) peer, (u_char *) node_peer,
+                        peer_len, node->peer_len);
 }
