@@ -1,35 +1,48 @@
 #!/usr/bin/env python3
 import argparse
 import json
-import socket
+import sys
 from pathlib import Path
 
-parser = argparse.ArgumentParser()
-parser.add_argument("socket_path")
-parser.add_argument("history_path")
-args = parser.parse_args()
+MARKER = "upstream_identity_change "
 
-socket_path = Path(args.socket_path)
-history_path = Path(args.history_path)
-history_path.parent.mkdir(parents=True, exist_ok=True)
-socket_path.parent.mkdir(parents=True, exist_ok=True)
 
-if socket_path.exists():
-    socket_path.unlink()
+def parse_fields(text):
+    fields = {}
+    for token in text.split('" '):
+        if '="' not in token:
+            continue
+        key, value = token.split('="', 1)
+        key = key.strip().split()[-1]
+        fields[key] = value.rstrip('"')
+    return fields
 
-sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-sock.bind(str(socket_path))
 
-try:
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("history_path")
+    args = parser.parse_args()
+
+    history_path = Path(args.history_path)
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+
     with history_path.open("a", encoding="utf-8", buffering=1) as history:
-        while True:
-            payload = sock.recv(8192)
-            event = json.loads(payload.decode("utf-8"))
+        for line in sys.stdin:
+            pos = line.find(MARKER)
+            if pos < 0:
+                continue
+            fields = parse_fields(line[pos + len(MARKER):])
+            if not all(name in fields for name in ("change", "upstream", "peer")):
+                continue
+            event = {
+                "schema_version": 1,
+                "source": "nginx_error_log",
+                "nginx_timestamp": line[:19],
+            }
+            event.update(fields)
             history.write(json.dumps(event, separators=(",", ":"), sort_keys=True) + "\n")
             history.flush()
-except KeyboardInterrupt:
-    pass
-finally:
-    sock.close()
-    if socket_path.exists():
-        socket_path.unlink()
+
+
+if __name__ == "__main__":
+    main()
