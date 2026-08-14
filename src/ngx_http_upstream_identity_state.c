@@ -1,6 +1,7 @@
 #include <ngx_config.h>
 #include <ngx_core.h>
 
+#include "ngx_http_upstream_identity_export.h"
 #include "ngx_http_upstream_identity_state.h"
 
 typedef struct {
@@ -57,12 +58,12 @@ ngx_http_upstream_identity_state_init_zone(ngx_shm_zone_t *shm_zone, void *data)
 ngx_int_t
 ngx_http_upstream_identity_state_track(ngx_shm_zone_t *shm_zone,
     ngx_log_t *log, const ngx_str_t *upstream, const u_char *peer,
-    size_t peer_len, const char *cert_sha256, const char *spki_sha256,
-    ngx_http_upstream_identity_event_t *event)
+    size_t peer_len, const char *cert_sha256, const char *spki_sha256)
 {
     ngx_slab_pool_t *shpool;
     ngx_http_upstream_identity_state_ctx_t *ctx;
     ngx_http_upstream_identity_state_node_t *state;
+    ngx_http_upstream_identity_event_t event;
     ngx_rbtree_key_t key;
     size_t size;
     u_char previous_cert[65] = "";
@@ -70,9 +71,7 @@ ngx_http_upstream_identity_state_track(ngx_shm_zone_t *shm_zone,
     const char *change = NULL;
     time_t event_time;
 
-    if (event != NULL) {
-        ngx_memzero(event, sizeof(*event));
-    }
+    ngx_memzero(&event, sizeof(event));
 
     if (shm_zone == NULL || shm_zone->data == NULL || upstream == NULL
         || peer == NULL || peer_len == 0 || cert_sha256 == NULL
@@ -120,14 +119,12 @@ ngx_http_upstream_identity_state_track(ngx_shm_zone_t *shm_zone,
         ngx_rbtree_insert(&ctx->rbtree, &state->node);
         change = "first_seen";
 
-        if (event != NULL) {
-            event->type = NGX_HTTP_UPSTREAM_IDENTITY_EVENT_FIRST_SEEN;
-            event->timestamp = event_time;
-            ngx_cpystrn(event->current_cert_sha256, state->cert_sha256,
-                        sizeof(event->current_cert_sha256));
-            ngx_cpystrn(event->current_spki_sha256, state->spki_sha256,
-                        sizeof(event->current_spki_sha256));
-        }
+        event.type = NGX_HTTP_UPSTREAM_IDENTITY_EVENT_FIRST_SEEN;
+        event.timestamp = event_time;
+        ngx_cpystrn(event.current_cert_sha256, state->cert_sha256,
+                    sizeof(event.current_cert_sha256));
+        ngx_cpystrn(event.current_spki_sha256, state->spki_sha256,
+                    sizeof(event.current_spki_sha256));
     } else {
         state->last_seen = event_time;
         state->observations++;
@@ -144,18 +141,16 @@ ngx_http_upstream_identity_state_track(ngx_shm_zone_t *shm_zone,
             state->changes++;
             change = "public_key_changed";
 
-            if (event != NULL) {
-                event->type = NGX_HTTP_UPSTREAM_IDENTITY_EVENT_PUBLIC_KEY_CHANGED;
-                event->timestamp = event_time;
-                ngx_cpystrn(event->previous_cert_sha256, previous_cert,
-                            sizeof(event->previous_cert_sha256));
-                ngx_cpystrn(event->current_cert_sha256, state->cert_sha256,
-                            sizeof(event->current_cert_sha256));
-                ngx_cpystrn(event->previous_spki_sha256, previous_spki,
-                            sizeof(event->previous_spki_sha256));
-                ngx_cpystrn(event->current_spki_sha256, state->spki_sha256,
-                            sizeof(event->current_spki_sha256));
-            }
+            event.type = NGX_HTTP_UPSTREAM_IDENTITY_EVENT_PUBLIC_KEY_CHANGED;
+            event.timestamp = event_time;
+            ngx_cpystrn(event.previous_cert_sha256, previous_cert,
+                        sizeof(event.previous_cert_sha256));
+            ngx_cpystrn(event.current_cert_sha256, state->cert_sha256,
+                        sizeof(event.current_cert_sha256));
+            ngx_cpystrn(event.previous_spki_sha256, previous_spki,
+                        sizeof(event.previous_spki_sha256));
+            ngx_cpystrn(event.current_spki_sha256, state->spki_sha256,
+                        sizeof(event.current_spki_sha256));
         } else if (ngx_strcmp(state->cert_sha256, cert_sha256) != 0) {
             ngx_cpystrn(previous_cert, state->cert_sha256,
                         sizeof(previous_cert));
@@ -166,19 +161,17 @@ ngx_http_upstream_identity_state_track(ngx_shm_zone_t *shm_zone,
             state->changes++;
             change = "certificate_changed_same_key";
 
-            if (event != NULL) {
-                event->type =
-                    NGX_HTTP_UPSTREAM_IDENTITY_EVENT_CERTIFICATE_CHANGED_SAME_KEY;
-                event->timestamp = event_time;
-                ngx_cpystrn(event->previous_cert_sha256, previous_cert,
-                            sizeof(event->previous_cert_sha256));
-                ngx_cpystrn(event->current_cert_sha256, state->cert_sha256,
-                            sizeof(event->current_cert_sha256));
-                ngx_cpystrn(event->previous_spki_sha256, previous_spki,
-                            sizeof(event->previous_spki_sha256));
-                ngx_cpystrn(event->current_spki_sha256, state->spki_sha256,
-                            sizeof(event->current_spki_sha256));
-            }
+            event.type =
+                NGX_HTTP_UPSTREAM_IDENTITY_EVENT_CERTIFICATE_CHANGED_SAME_KEY;
+            event.timestamp = event_time;
+            ngx_cpystrn(event.previous_cert_sha256, previous_cert,
+                        sizeof(event.previous_cert_sha256));
+            ngx_cpystrn(event.current_cert_sha256, state->cert_sha256,
+                        sizeof(event.current_cert_sha256));
+            ngx_cpystrn(event.previous_spki_sha256, previous_spki,
+                        sizeof(event.previous_spki_sha256));
+            ngx_cpystrn(event.current_spki_sha256, state->spki_sha256,
+                        sizeof(event.current_spki_sha256));
         }
     }
 
@@ -205,6 +198,9 @@ ngx_http_upstream_identity_state_track(ngx_shm_zone_t *shm_zone,
                       change, upstream, peer_len, peer,
                       previous_cert, cert_sha256, previous_spki, spki_sha256);
     }
+
+    (void) ngx_http_upstream_identity_export_event(log, &event,
+                                                    upstream, peer, peer_len);
 
     return NGX_OK;
 }
