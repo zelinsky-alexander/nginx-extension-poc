@@ -1,6 +1,8 @@
 #include <ngx_config.h>
 #include <ngx_core.h>
 
+#include <stdlib.h>
+
 #include "ngx_http_upstream_identity_export.h"
 
 #if (NGX_HAVE_UNIX_DOMAIN)
@@ -11,81 +13,83 @@
 #define NGX_HTTP_UPSTREAM_IDENTITY_JSON_MAX 4096
 #define NGX_HTTP_UPSTREAM_IDENTITY_ESCAPED_UPSTREAM_MAX 2048
 #define NGX_HTTP_UPSTREAM_IDENTITY_ESCAPED_PEER_MAX 512
+#define NGX_HTTP_UPSTREAM_IDENTITY_HISTORY_ENV \
+    "NGX_UPSTREAM_IDENTITY_HISTORY_SOCKET"
 
 static ngx_socket_t ngx_http_upstream_identity_export_socket = (ngx_socket_t) -1;
+static ngx_uint_t ngx_http_upstream_identity_export_initialized = 0;
 
 #if (NGX_HAVE_UNIX_DOMAIN)
 static struct sockaddr_un ngx_http_upstream_identity_export_addr;
 static socklen_t ngx_http_upstream_identity_export_addr_len;
 #endif
 
+static ngx_int_t ngx_http_upstream_identity_export_lazy_init(ngx_log_t *log);
 static const char *ngx_http_upstream_identity_event_name(
     ngx_http_upstream_identity_event_type_e type);
 static ngx_int_t ngx_http_upstream_identity_json_escape(const u_char *src,
     size_t src_len, u_char *dst, size_t dst_len);
 
-ngx_int_t
-ngx_http_upstream_identity_export_init(ngx_cycle_t *cycle,
-    const ngx_str_t *socket_path)
+static ngx_int_t
+ngx_http_upstream_identity_export_lazy_init(ngx_log_t *log)
 {
-    if (socket_path == NULL || socket_path->len == 0) {
-        return NGX_OK;
+    const char *path;
+    size_t path_len;
+
+    if (ngx_http_upstream_identity_export_initialized) {
+        return ngx_http_upstream_identity_export_socket == (ngx_socket_t) -1
+            ? NGX_DECLINED : NGX_OK;
+    }
+
+    ngx_http_upstream_identity_export_initialized = 1;
+    path = getenv(NGX_HTTP_UPSTREAM_IDENTITY_HISTORY_ENV);
+    if (path == NULL || path[0] == '\0') {
+        return NGX_DECLINED;
     }
 
 #if !(NGX_HAVE_UNIX_DOMAIN)
-    ngx_log_error(NGX_LOG_EMERG, cycle->log, 0,
-                  "upstream identity history export requires Unix-domain sockets");
-    return NGX_ERROR;
+    ngx_log_error(NGX_LOG_WARN, log, 0,
+                  "upstream identity history export disabled: "
+                  "Unix-domain sockets are unavailable");
+    return NGX_DECLINED;
 #else
-    if (socket_path->len >= sizeof(ngx_http_upstream_identity_export_addr.sun_path)) {
-        ngx_log_error(NGX_LOG_EMERG, cycle->log, 0,
-                      "upstream identity history socket path is too long: \"%V\"",
-                      socket_path);
-        return NGX_ERROR;
+    path_len = ngx_strlen(path);
+    if (path_len >= sizeof(ngx_http_upstream_identity_export_addr.sun_path)) {
+        ngx_log_error(NGX_LOG_WARN, log, 0,
+                      "upstream identity history export disabled: "
+                      "socket path is too long");
+        return NGX_DECLINED;
     }
 
     ngx_http_upstream_identity_export_socket = socket(AF_UNIX, SOCK_DGRAM, 0);
     if (ngx_http_upstream_identity_export_socket == (ngx_socket_t) -1) {
-        ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_socket_errno,
+        ngx_log_error(NGX_LOG_WARN, log, ngx_socket_errno,
                       "upstream identity history socket() failed");
-        return NGX_ERROR;
+        return NGX_DECLINED;
     }
 
     if (ngx_nonblocking(ngx_http_upstream_identity_export_socket) == -1) {
-        ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_socket_errno,
+        ngx_log_error(NGX_LOG_WARN, log, ngx_socket_errno,
                       "upstream identity history failed to set nonblocking mode");
         ngx_close_socket(ngx_http_upstream_identity_export_socket);
         ngx_http_upstream_identity_export_socket = (ngx_socket_t) -1;
-        return NGX_ERROR;
+        return NGX_DECLINED;
     }
 
     ngx_memzero(&ngx_http_upstream_identity_export_addr,
                 sizeof(ngx_http_upstream_identity_export_addr));
     ngx_http_upstream_identity_export_addr.sun_family = AF_UNIX;
-    ngx_memcpy(ngx_http_upstream_identity_export_addr.sun_path,
-               socket_path->data, socket_path->len);
-    ngx_http_upstream_identity_export_addr.sun_path[socket_path->len] = '\0';
+    ngx_memcpy(ngx_http_upstream_identity_export_addr.sun_path, path, path_len);
+    ngx_http_upstream_identity_export_addr.sun_path[path_len] = '\0';
     ngx_http_upstream_identity_export_addr_len =
-        (socklen_t) (offsetof(struct sockaddr_un, sun_path)
-                     + socket_path->len + 1);
+        (socklen_t) (offsetof(struct sockaddr_un, sun_path) + path_len + 1);
 
-    ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
-                  "upstream identity structured history export enabled socket=\"%V\"",
-                  socket_path);
+    ngx_log_error(NGX_LOG_NOTICE, log, 0,
+                  "upstream identity structured history export enabled "
+                  "socket=\"%s\"", path);
 
     return NGX_OK;
 #endif
-}
-
-void
-ngx_http_upstream_identity_export_close(ngx_cycle_t *cycle)
-{
-    (void) cycle;
-
-    if (ngx_http_upstream_identity_export_socket != (ngx_socket_t) -1) {
-        ngx_close_socket(ngx_http_upstream_identity_export_socket);
-        ngx_http_upstream_identity_export_socket = (ngx_socket_t) -1;
-    }
 }
 
 ngx_int_t
@@ -110,11 +114,14 @@ ngx_http_upstream_identity_export_event(ngx_log_t *log,
     ngx_err_t err;
     const char *event_name;
 
-    if (ngx_http_upstream_identity_export_socket == (ngx_socket_t) -1
-        || event == NULL
+    if (event == NULL
         || event->type == NGX_HTTP_UPSTREAM_IDENTITY_EVENT_NONE
         || upstream == NULL || peer == NULL || peer_len == 0)
     {
+        return NGX_DECLINED;
+    }
+
+    if (ngx_http_upstream_identity_export_lazy_init(log) != NGX_OK) {
         return NGX_DECLINED;
     }
 
@@ -155,7 +162,7 @@ ngx_http_upstream_identity_export_event(ngx_log_t *log,
     }
 
     sent = sendto(ngx_http_upstream_identity_export_socket,
-                  payload, payload_len, MSG_DONTWAIT,
+                  payload, payload_len, 0,
                   (struct sockaddr *) &ngx_http_upstream_identity_export_addr,
                   ngx_http_upstream_identity_export_addr_len);
 
@@ -169,7 +176,7 @@ ngx_http_upstream_identity_export_event(ngx_log_t *log,
                        "upstream identity history event dropped event=%s errno=%d",
                        event_name, err);
 
-        if (err == NGX_EAGAIN || err == NGX_ENOBUFS) {
+        if (err == NGX_EAGAIN) {
             return NGX_AGAIN;
         }
     }
