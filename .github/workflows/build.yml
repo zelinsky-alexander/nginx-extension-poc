@@ -19,12 +19,44 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential curl libpcre2-dev zlib1g-dev libssl-dev
 
-      - name: Build C history collector
+      - name: Build C history tools
         run: |
           cc -std=c11 -Wall -Wextra -Wpedantic -Werror -O2 \
             lab/history_collector.c \
             -o /tmp/nginx-upstream-identity-history-collector
+          cc -std=c11 -Wall -Wextra -Wpedantic -Werror -O2 \
+            lab/history_sender.c \
+            -o /tmp/nginx-upstream-identity-history-sender
           test -x /tmp/nginx-upstream-identity-history-collector
+          test -x /tmp/nginx-upstream-identity-history-sender
+
+      - name: Smoke test C history transport
+        run: |
+          set -euo pipefail
+          socket=/tmp/nginx-upstream-identity-ci.sock
+          history=/tmp/nginx-upstream-identity-ci.jsonl
+          rm -f "$socket" "$history"
+
+          /tmp/nginx-upstream-identity-history-collector "$socket" "$history" &
+          collector_pid=$!
+          trap 'kill "$collector_pid" 2>/dev/null || true; wait "$collector_pid" 2>/dev/null || true' EXIT
+
+          for _ in $(seq 1 50); do
+            [ -S "$socket" ] && break
+            sleep 0.1
+          done
+          test -S "$socket"
+
+          payload='{"schema_version":1,"timestamp":1,"change":"first_seen","upstream":"ci","peer":"127.0.0.1:443","previous_cert_sha256":"","current_cert_sha256":"a","previous_spki_sha256":"","current_spki_sha256":"b"}'
+          /tmp/nginx-upstream-identity-history-sender "$socket" "$payload"
+
+          for _ in $(seq 1 50); do
+            [ -s "$history" ] && break
+            sleep 0.1
+          done
+
+          test "$(wc -l < "$history")" -eq 1
+          grep -F '"change":"first_seen"' "$history"
 
       - name: Download NGINX source
         run: |
