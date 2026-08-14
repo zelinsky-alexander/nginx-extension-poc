@@ -4,14 +4,11 @@
 #include <ngx_config.h>
 #include <ngx_core.h>
 
-#include "ngx_http_upstream_identity_event.h"
-
 ngx_int_t ngx_http_upstream_identity_state_init_zone(ngx_shm_zone_t *shm_zone,
     void *data);
 
 ngx_int_t ngx_http_upstream_identity_state_track(ngx_shm_zone_t *shm_zone,
     ngx_log_t *log, const ngx_str_t *upstream, const u_char *peer,
-    size_t peer_len, const char *cert_sha256, const char *spki_sha256,
-    ngx_http_upstream_identity_event_t *event);
+    size_t peer_len, const char *cert_sha256, const char *spki_sha256);
 
 #endif
