@@ -19,6 +19,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential curl libpcre2-dev zlib1g-dev libssl-dev
 
+      - name: Build C history collector
+        run: |
+          cc -std=c11 -Wall -Wextra -Wpedantic -Werror -O2 \
+            lab/history_collector.c \
+            -o /tmp/nginx-upstream-identity-history-collector
+          test -x /tmp/nginx-upstream-identity-history-collector
+
       - name: Download NGINX source
         run: |
           curl -fLO "https://nginx.org/download/nginx-${{ matrix.nginx_version }}.tar.gz"
