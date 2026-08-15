@@ -2,23 +2,39 @@
 #include <ngx_core.h>
 #include <ngx_http.h>
 
+#include "ngx_http_upstream_identity_export.h"
 #include "ngx_http_upstream_identity_state.h"
 
 extern ngx_module_t ngx_http_upstream_identity_module;
 
 typedef struct {
+    ngx_str_t history_socket;
+} ngx_http_upstream_identity_status_main_conf_t;
+
+typedef struct {
     ngx_shm_zone_t *state_zone;
 } ngx_http_upstream_identity_status_loc_conf_t;
 
+static void *ngx_http_upstream_identity_status_create_main_conf(ngx_conf_t *cf);
 static void *ngx_http_upstream_identity_status_create_loc_conf(ngx_conf_t *cf);
 static char *ngx_http_upstream_identity_status_merge_loc_conf(ngx_conf_t *cf,
     void *parent, void *child);
+static char *ngx_http_upstream_identity_history_socket(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
 static char *ngx_http_upstream_identity_status(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 static ngx_int_t ngx_http_upstream_identity_status_handler(
     ngx_http_request_t *r);
 
 static ngx_command_t ngx_http_upstream_identity_status_commands[] = {
+    {
+        ngx_string("upstream_identity_history_socket"),
+        NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1,
+        ngx_http_upstream_identity_history_socket,
+        NGX_HTTP_MAIN_CONF_OFFSET,
+        0,
+        NULL
+    },
     {
         ngx_string("upstream_identity_status"),
         NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
@@ -33,7 +49,7 @@ static ngx_command_t ngx_http_upstream_identity_status_commands[] = {
 static ngx_http_module_t ngx_http_upstream_identity_status_module_ctx = {
     NULL,
     NULL,
-    NULL,
+    ngx_http_upstream_identity_status_create_main_conf,
     NULL,
     NULL,
     NULL,
@@ -55,6 +71,19 @@ ngx_module_t ngx_http_upstream_identity_status_module = {
     NULL,
     NGX_MODULE_V1_PADDING
 };
+
+static void *
+ngx_http_upstream_identity_status_create_main_conf(ngx_conf_t *cf)
+{
+    ngx_http_upstream_identity_status_main_conf_t *conf;
+
+    conf = ngx_pcalloc(cf->pool, sizeof(*conf));
+    if (conf == NULL) {
+        return NULL;
+    }
+
+    return conf;
+}
 
 static void *
 ngx_http_upstream_identity_status_create_loc_conf(ngx_conf_t *cf)
@@ -82,6 +111,34 @@ ngx_http_upstream_identity_status_merge_loc_conf(ngx_conf_t *cf, void *parent,
         conf->state_zone = prev->state_zone;
     }
 
+    return NGX_CONF_OK;
+}
+
+static char *
+ngx_http_upstream_identity_history_socket(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+    ngx_http_upstream_identity_status_main_conf_t *mcf = conf;
+    ngx_str_t *value;
+
+    (void) cmd;
+
+    if (mcf->history_socket.len != 0) {
+        return "is duplicate";
+    }
+
+    value = cf->args->elts;
+
+    if (ngx_http_upstream_identity_export_configure(cf->pool, &value[1])
+        != NGX_OK)
+    {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "invalid upstream identity history socket \"%V\"",
+                           &value[1]);
+        return NGX_CONF_ERROR;
+    }
+
+    mcf->history_socket = value[1];
     return NGX_CONF_OK;
 }
 
