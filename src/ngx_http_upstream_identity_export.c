@@ -18,6 +18,8 @@
 
 static ngx_socket_t ngx_http_upstream_identity_export_socket = (ngx_socket_t) -1;
 static ngx_uint_t ngx_http_upstream_identity_export_initialized = 0;
+static ngx_str_t ngx_http_upstream_identity_export_configured_path =
+    ngx_null_string;
 
 #if (NGX_HAVE_UNIX_DOMAIN)
 static struct sockaddr_un ngx_http_upstream_identity_export_addr;
@@ -29,6 +31,40 @@ static const char *ngx_http_upstream_identity_event_name(
     ngx_http_upstream_identity_event_type_e type);
 static ngx_int_t ngx_http_upstream_identity_json_escape(const u_char *src,
     size_t src_len, u_char *dst, size_t dst_len);
+
+ngx_int_t
+ngx_http_upstream_identity_export_configure(ngx_pool_t *pool,
+    const ngx_str_t *socket_path)
+{
+    u_char *copy;
+
+    if (pool == NULL || socket_path == NULL || socket_path->len == 0) {
+        return NGX_ERROR;
+    }
+
+#if !(NGX_HAVE_UNIX_DOMAIN)
+    return NGX_ERROR;
+#else
+    if (socket_path->len
+        >= sizeof(ngx_http_upstream_identity_export_addr.sun_path))
+    {
+        return NGX_ERROR;
+    }
+
+    copy = ngx_pnalloc(pool, socket_path->len + 1);
+    if (copy == NULL) {
+        return NGX_ERROR;
+    }
+
+    ngx_memcpy(copy, socket_path->data, socket_path->len);
+    copy[socket_path->len] = '\0';
+
+    ngx_http_upstream_identity_export_configured_path.data = copy;
+    ngx_http_upstream_identity_export_configured_path.len = socket_path->len;
+
+    return NGX_OK;
+#endif
+}
 
 static ngx_int_t
 ngx_http_upstream_identity_export_lazy_init(ngx_log_t *log)
@@ -42,9 +78,17 @@ ngx_http_upstream_identity_export_lazy_init(ngx_log_t *log)
     }
 
     ngx_http_upstream_identity_export_initialized = 1;
-    path = getenv(NGX_HTTP_UPSTREAM_IDENTITY_HISTORY_ENV);
-    if (path == NULL || path[0] == '\0') {
-        return NGX_DECLINED;
+
+    if (ngx_http_upstream_identity_export_configured_path.len != 0) {
+        path = (const char *)
+            ngx_http_upstream_identity_export_configured_path.data;
+        path_len = ngx_http_upstream_identity_export_configured_path.len;
+    } else {
+        path = getenv(NGX_HTTP_UPSTREAM_IDENTITY_HISTORY_ENV);
+        if (path == NULL || path[0] == '\0') {
+            return NGX_DECLINED;
+        }
+        path_len = ngx_strlen(path);
     }
 
 #if !(NGX_HAVE_UNIX_DOMAIN)
@@ -53,7 +97,6 @@ ngx_http_upstream_identity_export_lazy_init(ngx_log_t *log)
                   "Unix-domain sockets are unavailable");
     return NGX_DECLINED;
 #else
-    path_len = ngx_strlen(path);
     if (path_len >= sizeof(ngx_http_upstream_identity_export_addr.sun_path)) {
         ngx_log_error(NGX_LOG_WARN, log, 0,
                       "upstream identity history export disabled: "
