@@ -37,7 +37,7 @@ jobs:
           history=/tmp/nginx-upstream-identity-ci.jsonl
           rm -f "$socket" "$history"
 
-          /tmp/nginx-upstream-identity-history-collector "$socket" "$history" &
+          /tmp/nginx-upstream-identity-history-collector --sync none "$socket" "$history" &
           collector_pid=$!
           trap 'kill "$collector_pid" 2>/dev/null || true; wait "$collector_pid" 2>/dev/null || true' EXIT
 
@@ -46,6 +46,7 @@ jobs:
             sleep 0.1
           done
           test -S "$socket"
+          test "$(stat -c %a "$socket")" = "600"
 
           payload='{"schema_version":1,"timestamp":1,"change":"first_seen","upstream":"ci","peer":"127.0.0.1:443","previous_cert_sha256":"","current_cert_sha256":"a","previous_spki_sha256":"","current_spki_sha256":"b"}'
           /tmp/nginx-upstream-identity-history-sender "$socket" "$payload"
@@ -57,6 +58,50 @@ jobs:
 
           test "$(wc -l < "$history")" -eq 1
           grep -F '"change":"first_seen"' "$history"
+
+      - name: Test collector SIGHUP reopen
+        run: |
+          set -euo pipefail
+          socket=/tmp/nginx-upstream-identity-reopen.sock
+          history=/tmp/nginx-upstream-identity-reopen.jsonl
+          rotated=/tmp/nginx-upstream-identity-reopen.jsonl.1
+          rm -f "$socket" "$history" "$rotated"
+
+          /tmp/nginx-upstream-identity-history-collector --sync always "$socket" "$history" &
+          collector_pid=$!
+          trap 'kill "$collector_pid" 2>/dev/null || true; wait "$collector_pid" 2>/dev/null || true' EXIT
+
+          for _ in $(seq 1 50); do
+            [ -S "$socket" ] && break
+            sleep 0.1
+          done
+          test -S "$socket"
+
+          payload1='{"schema_version":1,"timestamp":1,"change":"first_seen"}'
+          /tmp/nginx-upstream-identity-history-sender "$socket" "$payload1"
+
+          for _ in $(seq 1 50); do
+            [ -s "$history" ] && break
+            sleep 0.1
+          done
+          test "$(wc -l < "$history")" -eq 1
+
+          mv "$history" "$rotated"
+          : > "$history"
+          kill -HUP "$collector_pid"
+          sleep 0.2
+
+          payload2='{"schema_version":1,"timestamp":2,"change":"public_key_changed"}'
+          /tmp/nginx-upstream-identity-history-sender "$socket" "$payload2"
+
+          for _ in $(seq 1 50); do
+            [ -s "$history" ] && break
+            sleep 0.1
+          done
+
+          test "$(wc -l < "$rotated")" -eq 1
+          test "$(wc -l < "$history")" -eq 1
+          grep -F '"change":"public_key_changed"' "$history"
 
       - name: Download NGINX source
         run: |
