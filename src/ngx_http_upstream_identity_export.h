@@ -6,6 +6,9 @@
 
 #include "ngx_http_upstream_identity_event.h"
 
+ngx_int_t ngx_http_upstream_identity_export_configure(ngx_pool_t *pool,
+    const ngx_str_t *socket_path);
+
 ngx_int_t ngx_http_upstream_identity_export_event(ngx_log_t *log,
     const ngx_http_upstream_identity_event_t *event,
     const ngx_str_t *upstream, const u_char *peer, size_t peer_len);
